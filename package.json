@@ -16,6 +16,10 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "mysql2": "^3.11.0",
-    "openai": "^4.63.0"
+    "openai": "^4.63.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@flydotio/dockerfile": "^0.5.9"
   }
 }

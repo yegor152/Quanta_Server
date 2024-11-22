@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 const { OpenAI } = require('openai');
 require('dotenv').config();
 const http = require('http');
@@ -26,15 +26,12 @@ app.use(rateLimit({
 
 
 
-const pool = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    connectionLimit: 10
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
-
-process.env.OPENAI_API_KEY
 
 
 class QuantaFTT {
@@ -541,16 +538,18 @@ async function isUserValidated(id){
     }
 }
 
-async function saveSubmission(values){
-    const query =`
+async function saveSubmission(values) {
+    const query = `
         INSERT INTO submissions (
-      memberstack_user_id, problem_id, user_input,
-          overall_grade, all_response) 
-      VALUES (?, ?, ?, ?, ?)
-        `
+            memberstack_user_id, problem_id, user_input,
+            overall_grade, all_response
+        ) 
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+    `;
     try {
-        const [results] = await pool.execute(query, values);
-        return results.insertId;
+        const result = await pool.query(query, values);
+        return result.rows[0].id;
     } catch (err) {
         console.error('Error inserting data:', err);
         return null;
@@ -573,18 +572,18 @@ app.post('/getUserSubmissions', async (req, res) =>{
         const submissionsQuery = `
             SELECT problem_id, id, overall_grade
             FROM submissions
-            WHERE memberstack_user_id = ?
+            WHERE memberstack_user_id = $1
             ORDER BY time DESC;
         `;
 
-        const [submissions] = await pool.execute(submissionsQuery, [user_id]);
+        const submissions = await pool.query(submissionsQuery, [user_id]);
 
         const problemsQuery = `
-    SELECT id
-    FROM problems;
-`;
+            SELECT id
+            FROM problems;
+        `;
 
-        const [problems] = await pool.execute(problemsQuery);
+        const problems = await pool.query(problemsQuery);
         let result = {}
         problems.forEach((problem) => {
             result[problem.id] = [];
@@ -619,20 +618,19 @@ app.post('/getSubmission', async (req, res) =>{
             return res.status(401).json({ error: "Invalid user ID" });
         }
 
-
         const submissionDetailsQuery = `
             SELECT user_input, all_response
             FROM submissions
-            WHERE id = ?;
+            WHERE id = $1;
         `;
 
-        const [submissionDetails] = await pool.execute(submissionDetailsQuery, [submission_id]);
+        const submissionDetails = await pool.query(submissionDetailsQuery, [submission_id]);
 
-        if (submissionDetails.length === 0) {
+        if (submissionDetails.rows.length === 0) {
             return res.status(404).json({ message: 'Submission not found' });
         }
 
-        res.status(200).json(submissionDetails[0]);
+        res.status(200).json(submissionDetails.rows[0]);
 
     } catch (error) {
         console.error(error);
@@ -654,20 +652,19 @@ app.post('/generateResponse', async (req, res) => {
 
     try {
         const query = `
-      SELECT problem_statement, solution, extra_requirements_validity
-      FROM problems 
-      WHERE id = ?
-    `;
+            SELECT problem_statement, solution, extra_requirements_validity
+            FROM problems 
+            WHERE id = $1
+        `;
 
-        const [rows] = await pool.execute(query, [problem_id]);
+        const result = await pool.query(query, [problem_id]);
 
-        if (rows.length === 0) {
+        if (result.rows.length === 0) {
             return res.status(404).json({ error: "Problem not found" });
         }
 
-        const {problem_statement, solution, extra_requirements_validity} = rows[0];
+        const { problem_statement, solution, extra_requirements_validity } = result.rows[0];
         const response = await evaluateSolution(problem_statement, solution, student_solution, extra_requirements_validity);
-
 
         let subm_id = await saveSubmission([
             user_id,
@@ -677,8 +674,7 @@ app.post('/generateResponse', async (req, res) => {
             response,
         ]);
 
-
-        res.json({response: response, submission_id: subm_id});
+        res.json({ response: response, submission_id: subm_id });
     } catch (error) {
         console.error('Error in generateResponse:', error);
         res.status(500).json({ error: "Internal server error" });
@@ -693,15 +689,14 @@ app.post('/getProblems', async (req, res) => {
     }
 
     try {
-        const placeholders = ids.map(() => '?').join(',');
         const query = `
-      SELECT id, problem_statement
-      FROM problems 
-      WHERE id IN (${placeholders})
-    `;
+            SELECT id, problem_statement
+            FROM problems 
+            WHERE id = ANY($1)
+        `;
 
-        const [rows] = await pool.execute(query, ids);
-        const problems = rows.reduce((acc, { id, problem_statement }) => {
+        const result = await pool.query(query, [ids]);
+        const problems = result.rows.reduce((acc, { id, problem_statement }) => {
             acc[id] = problem_statement;
             return acc;
         }, {});
@@ -721,25 +716,25 @@ app.post('/submitFeedback', async (req, res) => {
     }
 
     try {
-        const [submission] = await pool.execute(
-            'SELECT memberstack_user_id FROM submissions WHERE id = ?',
+        const submission = await pool.query(
+            'SELECT memberstack_user_id FROM submissions WHERE id = $1',
             [submission_id]
         );
 
-        if (submission.length === 0) {
+        if (submission.rows.length === 0) {
             return res.status(404).json({ saved: false, message: "Submission not found" });
         }
 
-        if (submission[0].memberstack_user_id !== memberstack_user_id) {
+        if (submission.rows[0].memberstack_user_id !== memberstack_user_id) {
             return res.status(403).json({ saved: false, message: "User does not own this submission" });
         }
 
-        const [result] = await pool.execute(
-            'UPDATE submissions SET liked_by_user = ? WHERE id = ?',
+        const result = await pool.query(
+            'UPDATE submissions SET liked_by_user = $1 WHERE id = $2',
             [liked_by_user, submission_id]
         );
 
-        if (result.affectedRows === 1) {
+        if (result.rowCount === 1) {
             return res.json({ saved: true });
         } else {
             return res.status(500).json({ saved: false, message: "Failed to update submission" });
