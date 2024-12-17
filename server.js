@@ -7,6 +7,7 @@ const http = require('http');
 const app = express();
 const memberstackAdmin = require("@memberstack/admin");
 const rateLimit = require('express-rate-limit');
+const axios = require("axios");
 
 
 const memberstack = memberstackAdmin.init(process.env.MS_KEY);
@@ -34,148 +35,187 @@ const pool = mysql.createPool({
     connectionLimit: 10
 });
 
-process.env.OPENAI_API_KEY
+async function readGoogleDocTextFile(url) {
+    try {
+        // Extract file ID from the URL
+        const fileId = url.match(/[-\w]{25,}/)?.[0];
+        if (!fileId) {
+            throw new Error('Invalid Google Drive URL');
+        }
+
+        // Construct the direct download URL
+        const downloadUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+
+        // Fetch the file content
+        const response = await axios.get(downloadUrl, {
+            responseType: 'text'
+        });
+
+        return response.data;
+
+    } catch (error) {
+        if (error.response?.status === 404) {
+            throw new Error('File not found or not publicly accessible');
+        }
+        throw new Error(`Failed to read file: ${error.message}`);
+    }
+}
 
 
 class QuantaFTT {
-    constructor(oai_api_key,
-                instructions_sanity_checker, instructions_sol_refiner, instructions_validity_reviewer, instructions_feedback_cleaner,
-                oai_sanity_model_id, oai_refiner_model_id, oai_validity_model_id, oai_feedback_cleaner_id) {
-        this.oai_client = new OpenAI({ apiKey: oai_api_key });
+    constructor(oaiApiKey,
+                instructionsSanityChecker, instructionsSolRefiner, instructionsValidityReviewer,
+                instructionsQualityReviewer, instructionsFeedbackCleaner,
+                cotShotsSanity, cotShotsQuality, cotShotsValidity,
+                oaiSanityModelId, oaiRefinerModelId, oaiValidityModelId,
+                oaiQualityModelId, oaiFeedbackCleanerId) {
 
-        this.instructions_sanity_checker = instructions_sanity_checker;
-        this.instructions_sol_refiner = instructions_sol_refiner;
-        this.instructions_validity_reviewer = instructions_validity_reviewer;
-        this.instructions_feedback_cleaner = instructions_feedback_cleaner;
+        this.oaiApiKey = oaiApiKey;
+        this.oaiClient = new OpenAI({apiKey: oaiApiKey});
 
-        this.oai_sanity_model_id = oai_sanity_model_id;
-        this.oai_refiner_model_id = oai_refiner_model_id;
-        this.oai_validity_model_id = oai_validity_model_id;
-        this.oai_feedback_cleaner_id = oai_feedback_cleaner_id;
+        this.instructionsSanityChecker = instructionsSanityChecker;
+        this.instructionsSolRefiner = instructionsSolRefiner;
+        this.instructionsValidityReviewer = instructionsValidityReviewer;
+        this.instructionsQualityReviewer = instructionsQualityReviewer;
+        this.instructionsFeedbackCleaner = instructionsFeedbackCleaner;
+
+        this.cotShotsSanity = cotShotsSanity;
+        this.cotShotsQuality = cotShotsQuality;
+        this.cotShotsValidity = cotShotsValidity;
+
+        this.oaiSanityModelId = oaiSanityModelId;
+        this.oaiRefinerModelId = oaiRefinerModelId;
+        this.oaiValidityModelId = oaiValidityModelId;
+        this.oaiQualityModelId = oaiQualityModelId;
+        this.oaiFeedbackCleanerId = oaiFeedbackCleanerId;
     }
 
-    async get_oai_response(model_id, instructions, prompt, json_format = false) {
-        const messages = [
-            { role: "system", content: instructions },
-            { role: "user", content: prompt }
-        ];
+    async getOaiResponse(modelId, instructions, prompt, jsonFormat = false) {
+        const response = await this.oaiClient.chat.completions.create({
+            model: modelId,
+            messages: [
+                {role: "system", content: instructions},
+                {role: "user", content: prompt}
+            ],
+            response_format: jsonFormat ? {type: "json_object"} : undefined
+        });
 
-        const options = {
-            model: model_id,
-            messages: messages
-        };
-
-        if (json_format) {
-            options.response_format = { type: "json_object" };
-        }
-
-        const response = await this.oai_client.chat.completions.create(options);
         return response.choices[0].message.content;
     }
 
-    async get_oai_response_2_nonjson(model_id, instructions, prompt, model_response, prompt_2) {
-        const response = await this.oai_client.chat.completions.create({
-            model: model_id,
+    async getOaiResponse2Nonjson(modelId, instructions, prompt, modelResponse, prompt2) {
+        const response = await this.oaiClient.chat.completions.create({
+            model: modelId,
             messages: [
-                { role: "system", content: instructions },
-                { role: "user", content: prompt },
-                { role: "assistant", content: model_response },
-                { role: "user", content: prompt_2 },
+                {role: "system", content: instructions},
+                {role: "user", content: prompt},
+                {role: "assistant", content: modelResponse},
+                {role: "user", content: prompt2}
             ]
         });
+
         return response.choices[0].message.content;
     }
 
-    async gen_sanity_feedback(problem_statement, correct_solutions, input_solution) {
+    async genSanityFeedback(problemStatement, correctSolutions, inputSolution) {
         const prompt = `
     # Here is the problem statement:
-    ${problem_statement}
+    ${problemStatement}
     # For which the correct solution(s) are:
-    ${correct_solutions}
+    ${correctSolutions}
     # And the Input Solution that I want you to do a sanity check for is:
-    ${input_solution}
+    ${inputSolution}
+
+    ${this.cotShotsSanity}
     `;
-        const model_response = await this.get_oai_response(
-            this.oai_sanity_model_id,
-            this.instructions_sanity_checker,
+
+        return await this.getOaiResponse(
+            this.oaiSanityModelId,
+            this.instructionsSanityChecker,
             prompt,
             true
         );
-        return model_response;
     }
 
-    async gen_smart_sanity_feedback(problem_statement, correct_solutions, input_solution, num_reruns) {
-        let confidence_level = 0.95;
+    async genSmartSanityFeedback(problemStatement, correctSolutions, inputSolution, numReruns) {
+        let confidenceLevel = 0.95;
+        const sanityFeedbacksList = [];
+        const sanityStatusesList = [];
 
-        let sanity_feedbacks_list = [];
-        let sanity_statuses_list = [];
-        for (let i = 0; i < num_reruns; i++) {
-            const sanity_feedback = await this.gen_sanity_feedback(
-                problem_statement,
-                correct_solutions,
-                input_solution
+        for (let i = 0; i < numReruns; i++) {
+            const sanityFeedback = await this.genSanityFeedback(
+                problemStatement,
+                correctSolutions,
+                inputSolution
             );
+
             try {
-                const sanity_feedback_dict = JSON.parse(sanity_feedback);
-                sanity_feedbacks_list.push(sanity_feedback_dict);
-                sanity_statuses_list.push(sanity_feedback_dict['Sanity Status']);
+                const sanityFeedbackDict = JSON.parse(sanityFeedback);
+                sanityFeedbacksList.push(sanityFeedbackDict);
+                sanityStatusesList.push(sanityFeedbackDict.Sanity_Status);
             } catch {
-                sanity_feedbacks_list.push(sanity_feedback);
-                sanity_statuses_list.push("error_json_formatting");
+                sanityFeedbacksList.push(sanityFeedback);
+                sanityStatusesList.push("Error_JSON_Formatting");
             }
         }
 
-        let majority_status = null;
-        let majority_status_justification = null;
-        for (let i = 0; i < num_reruns; i++) {
-            if (sanity_statuses_list.filter(status => status === sanity_statuses_list[i]).length > Math.floor(num_reruns / 2)) {
-                majority_status = sanity_statuses_list[i];
-                majority_status_justification = sanity_feedbacks_list[i];
-                confidence_level *= sanity_statuses_list.filter(status => status === sanity_statuses_list[i]).length / num_reruns;
+        let majorityStatus = null;
+        let majorityStatusFeedback = null;
+
+        for (let i = 0; i < numReruns; i++) {
+            const count = sanityStatusesList.filter(status => status === sanityStatusesList[i]).length;
+            if (count > numReruns / 2) {
+                majorityStatus = sanityStatusesList[i];
+                majorityStatusFeedback = sanityFeedbacksList[i];
+                confidenceLevel *= count / numReruns;
                 break;
             }
         }
 
-        if (majority_status === 'Fail') {
+        if (majorityStatus === 'Fail') {
             return {
-                'Overall Grade': 'FF',
-                'Sanity Status': 'Fail',
-                'Sanity Status Justification': majority_status_justification['Sanity Status Justification'],
-                'Confidence in this Status': `${Math.round(100 * confidence_level)}%`
+                Overall_Grade: 'FF',
+                Sanity_Status: 'Fail',
+                Sanity_Status_Justification: majorityStatusFeedback.Sanity_Status_Justification,
+                Sanity_Chain_of_Thought: majorityStatusFeedback.Chain_of_Thought,
+                Confidence_In_This_Status: `${Math.floor(100 * confidenceLevel)}%`
             };
         }
 
-        if (majority_status !== 'Pass') {
+        if (majorityStatus !== 'Pass') {
             return {
-                'Sanity Status': 'Error',
-                'Details': 'Most probably the model could not decide what to say'
+                Overall_Grade: '-',
+                Sanity_Status: 'Error',
+                Sanity_Status_Justification: 'Most probably the model could not decide what to say'
             };
         }
 
-        if (majority_status === 'Pass') {
+        if (majorityStatus === 'Pass') {
             return {
-                'Sanity Status': 'Pass',
-                'Sanity Status Justification': '-',
-                'current_confidence_level': confidence_level
+                Sanity_Status: 'Pass',
+                Sanity_Status_Justification: '-',
+                Sanity_Chain_of_Thought: majorityStatusFeedback.Chain_of_Thought,
+                Current_Confidence_Level: confidenceLevel
             };
         }
     }
 
-    async gen_refined_solution(problem_statement, input_solution) {
+    async genRefinedSolution(problemStatement, inputSolution) {
         const prompt = `
     # Here is the problem statement:
-    ${problem_statement}
+    ${problemStatement}
     # And here is the Input Solution that I want you to proofread and refine as per given instructions:
-    ${input_solution}
+    ${inputSolution}
     `;
-        let model_response = await this.get_oai_response(
-            this.oai_refiner_model_id,
-            this.instructions_sol_refiner,
+
+        const modelResponse = await this.getOaiResponse(
+            this.oaiRefinerModelId,
+            this.instructionsSolRefiner,
             prompt
         );
 
-        if (model_response.length / input_solution.length > 2) {
-            const prompt_2 = `
+        if (modelResponse.length / inputSolution.length > 2) {
+            const prompt2 = `
       The length of your output is more than twice the length of the Input Solution, which violates one of the rules from the instructions you need to follow!
 
       Please carefully go through the instructions and the original input solution again. In particular, please note:
@@ -186,335 +226,313 @@ class QuantaFTT {
 
       Now, please output (in **Markdown**) a refined version of the Input Solution. Once again, do **NOT** include any markers or problem statement.
       `;
-            const upd_model_response = await this.get_oai_response_2_nonjson(
-                this.oai_refiner_model_id,
-                this.instructions_sol_refiner,
+
+            const updModelResponse = await this.getOaiResponse2Nonjson(
+                this.oaiRefinerModelId,
+                this.instructionsSolRefiner,
                 prompt,
-                model_response,
-                prompt_2
+                modelResponse,
+                prompt2
             );
 
-            if (upd_model_response.length / input_solution.length > 2.5) {
-                return input_solution;
+            if (updModelResponse.length / inputSolution.length > 2.5) {
+                return inputSolution;
             } else {
-                return upd_model_response;
+                return updModelResponse;
             }
-        } else {
-            return model_response;
         }
+
+        return modelResponse;
     }
 
-    async gen_validity_feedback(problem_statement, correct_solutions, optional_reviewing_requirements, input_solution, refined_input_solution) {
+    async genValidityFeedback(problemStatement, correctSolutions, optionalReviewingRequirements,
+                              inputSolution, refinedInputSolution) {
         const prompt = `
     # Here is the problem statement:
-    ${problem_statement}
+    ${problemStatement}
     # For which the correct solution(s) are:
-    ${correct_solutions}
+    ${correctSolutions}
     # Optional extra requirements for validation process are:
-    ${optional_reviewing_requirements}
+    ${optionalReviewingRequirements}
     # The Input Solution that I want you to give me feedback for is:
-    ${input_solution}
+    ${inputSolution}
     # Finally, here is a proofread and more potentially clearer version of the Input Solution. Please take it into account when producing feedback as well:
-    ${refined_input_solution}
+    ${refinedInputSolution}
+
+    ${this.cotShotsValidity}
     `;
 
-        const model_response = await this.get_oai_response(
-            this.oai_validity_model_id,
-            this.instructions_validity_reviewer,
+        return await this.getOaiResponse(
+            this.oaiValidityModelId,
+            this.instructionsValidityReviewer,
             prompt,
             true
         );
-
-        return model_response;
     }
 
-    async gen_smart_validity_feedback(problem_statement, correct_solutions, input_solution, refined_input_solution, optional_reviewing_requirements,
-                                      num_reruns, current_confidence_level) {
-        let validity_feedbacks_list = [];
-        let validity_grades_list = [];
-        for (let i = 0; i < num_reruns; i++) {
-            const validity_feedback = await this.gen_validity_feedback(
-                problem_statement,
-                correct_solutions,
-                optional_reviewing_requirements,
-                input_solution,
-                refined_input_solution
+    async genSmartValidityFeedback(problemStatement, correctSolutions, inputSolution,
+                                   refinedInputSolution, optionalReviewingRequirements,
+                                   numReruns = 5, currentConfidenceLevel = 0.95) {
+        const validityFeedbacksList = [];
+        const validityGradesList = [];
+
+        for (let i = 0; i < numReruns; i++) {
+            const validityFeedback = await this.genValidityFeedback(
+                problemStatement,
+                correctSolutions,
+                optionalReviewingRequirements,
+                inputSolution,
+                refinedInputSolution
             );
+
             try {
-                const validity_feedback_dict = JSON.parse(validity_feedback);
-                validity_feedbacks_list.push(validity_feedback_dict);
-                validity_grades_list.push(validity_feedback_dict['Validity Grade']);
+                const validityFeedbackDict = JSON.parse(validityFeedback);
+                validityFeedbacksList.push(validityFeedbackDict);
+                validityGradesList.push(validityFeedbackDict.Validity_Grade);
             } catch {
-                validity_feedbacks_list.push(validity_feedback);
-                validity_grades_list.push("error_json_formatting");
+                validityFeedbacksList.push(validityFeedback);
+                validityGradesList.push("Error_JSON_Formatting");
             }
         }
 
-        let majority_status = null;
-        let majority_status_justification = null;
-        let confidence_level = current_confidence_level;
-        for (let i = 0; i < num_reruns; i++) {
-            if (validity_grades_list.filter(grade => grade === validity_grades_list[i]).length > Math.floor(num_reruns / 2)) {
-                majority_status = validity_grades_list[i];
-                majority_status_justification = validity_feedbacks_list[i];
-                confidence_level *= validity_grades_list.filter(grade => grade === validity_grades_list[i]).length / num_reruns;
+        let majorityStatus = null;
+        let majorityStatusJustification = null;
+        let confidenceLevel = currentConfidenceLevel;
+
+        for (let i = 0; i < numReruns; i++) {
+            const count = validityGradesList.filter(grade => grade === validityGradesList[i]).length;
+            if (count > numReruns / 2) {
+                majorityStatus = validityGradesList[i];
+                majorityStatusJustification = validityFeedbacksList[i];
+                confidenceLevel *= count / numReruns;
                 break;
             }
         }
 
-        if (majority_status === null) {
+        if (!majorityStatus) {
             return {
-                'Validity Grade': '-',
-                'Validity Feedback': 'The model could not agree on the final grade.',
-                'Model Validity Grades': validity_grades_list
+                Validity_Grade: '-',
+                Validity_Feedback: 'The model could not agree on the final grade.',
+                Model_Validity_Grades: validityGradesList
             };
-        } else {
-            majority_status_justification['Confidence in Validify Feedback'] = `${Math.round(100 * confidence_level)}%`;
-            return majority_status_justification;
         }
+
+        majorityStatusJustification.Confidence_In_Validify_Feedback = `${Math.floor(100 * confidenceLevel)}%`;
+        return majorityStatusJustification;
     }
 
-    async gen_full_feedback(problem_statement, correct_solutions, input_solution, validity_optional_reviewing_requirements,
-                            num_reruns = 5) {
-        let final_confidence_level = 0.95;
+    async genQualityFeedback(problemStatement, correctSolutions, optionalReviewingRequirements,
+                             inputSolution) {
+        const prompt = `
+    # Here is the problem statement:
+    ${problemStatement}
+    # For which the correct solution(s) are:
+    ${correctSolutions}
+    # Optional extra requirements for quality-reveiwing process are:
+    ${optionalReviewingRequirements}
+    # The Input Solution that I want you to give me feedback for is:
+    ${inputSolution}
 
-        const final_sanity_feedback = await this.gen_smart_sanity_feedback(
-            problem_statement,
-            correct_solutions,
-            input_solution,
-            num_reruns
+    ${this.cotShotsQuality}
+    `;
+
+        return await this.getOaiResponse(
+            this.oaiQualityModelId,
+            this.instructionsQualityReviewer,
+            prompt,
+            true
         );
+    }
 
-        if (final_sanity_feedback['Sanity Status'] === 'Fail' || final_sanity_feedback['Sanity Status'] === 'Error') {
-            return final_sanity_feedback;
-        }
-        if (final_sanity_feedback['Sanity Status'] === 'Pass') {
-            const refined_input_solution = await this.gen_refined_solution(problem_statement, input_solution);
-            const prefinal_validity_feedback = await this.gen_smart_validity_feedback(
-                problem_statement,
-                correct_solutions,
-                input_solution,
-                refined_input_solution,
-                validity_optional_reviewing_requirements,
-                num_reruns,
-                final_sanity_feedback['current_confidence_level']
+    async genSmartQualityFeedback(problemStatement, correctSolutions, inputSolution,
+                                  optionalReviewingRequirements,
+                                  numReruns = 5, currentConfidenceLevel = 0.95) {
+        const qualityFeedbacksList = [];
+        const qualityGradesList = [];
+
+        for (let i = 0; i < numReruns; i++) {
+            const qualityFeedback = await this.genQualityFeedback(
+                problemStatement,
+                correctSolutions,
+                optionalReviewingRequirements,
+                inputSolution
             );
 
-            // this is where another step of algorithm will be added later...
-            prefinal_validity_feedback['Overall Grade'] = prefinal_validity_feedback['Validity Grade'];
-            return prefinal_validity_feedback;
+            try {
+                const qualityFeedbackDict = JSON.parse(qualityFeedback);
+                qualityFeedbacksList.push(qualityFeedbackDict);
+                qualityGradesList.push(qualityFeedbackDict.Quality_Grade);
+            } catch {
+                qualityFeedbacksList.push(qualityFeedback);
+                qualityGradesList.push("Error_JSON_Formatting");
+            }
         }
 
+        let majorityStatus = null;
+        let majorityStatusJustification = null;
+        let confidenceLevel = currentConfidenceLevel;
+
+        for (let i = 0; i < numReruns; i++) {
+            const count = qualityGradesList.filter(grade => grade === qualityGradesList[i]).length;
+            if (count > numReruns / 2) {
+                majorityStatus = qualityGradesList[i];
+                majorityStatusJustification = qualityFeedbacksList[i];
+                confidenceLevel *= count / numReruns;
+                break;
+            }
+        }
+
+        if (!majorityStatus) {
+            return {
+                Quality_Grade: '-',
+                Quality_Feedback: 'The model could not agree on the final grade.',
+                Model_Quality_Grades: qualityGradesList
+            };
+        }
+
+        majorityStatusJustification.Confidence_In_Quality_Feedback = `${Math.floor(100 * confidenceLevel)}%`;
+        return majorityStatusJustification;
+    }
+
+    async genCleanedVersion(modelResponse) {
+        const prompt = `Here is the feedback that you need to potentially refine as per given instructions:
+    ${modelResponse}
+    `;
+
+        return await this.getOaiResponse(
+            this.oaiFeedbackCleanerId,
+            this.instructionsFeedbackCleaner,
+            prompt
+        );
+    }
+
+    async genFullFeedback(problemStatement, correctSolutions, inputSolution,
+                          validityOptionalReviewingRequirements, qualityOptionalReviewingRequirements,
+                          BEFHintsFreeVersion = true, numReruns = 5) {
+        let finalConfidenceLevel = 0.95; // will be adjusted as more checks are conducted
+
+        const finalSanityFeedback = await this.genSmartSanityFeedback(
+            problemStatement,
+            correctSolutions,
+            inputSolution,
+            numReruns
+        );
+
+        if (['Fail', 'fail', 'Error', 'error'].includes(finalSanityFeedback.Sanity_Status)) {
+            return finalSanityFeedback;
+        }
+
+        if (finalSanityFeedback.Sanity_Status === 'Pass') {
+            const refinedInputSolution = await this.genRefinedSolution(problemStatement, inputSolution);
+
+            const prefinalValidityFeedback = await this.genSmartValidityFeedback(
+                problemStatement,
+                correctSolutions,
+                inputSolution,
+                refinedInputSolution,
+                validityOptionalReviewingRequirements,
+                numReruns,
+                finalSanityFeedback.Current_Confidence_Level
+            );
+
+            const prefinalQualityFeedback = await this.genSmartQualityFeedback(
+                problemStatement,
+                correctSolutions,
+                inputSolution,
+                qualityOptionalReviewingRequirements,
+                numReruns,
+                0.95
+            );
+
+            try {
+                const validityGrade = prefinalValidityFeedback.Validity_Grade;
+                const qualityGrade = prefinalQualityFeedback.Quality_Grade;
+
+                // Change non-confident grade A to grade B
+                const percentageStringConfValidity = prefinalValidityFeedback.Confidence_In_Validify_Feedback;
+                const percentageStringConfQuality = prefinalQualityFeedback.Confidence_In_Quality_Feedback;
+                const percentageIntNumConfValidity = parseInt(percentageStringConfValidity.replace('%', ''));
+                const percentageIntNumConfQuality = parseInt(percentageStringConfQuality.replace('%', ''));
+
+                if (validityGrade === 'A' && percentageIntNumConfValidity < 75) {
+                    prefinalValidityFeedback.Validity_Grade = 'B';
+                }
+                if (qualityGrade === 'A' && percentageIntNumConfQuality < 75) {
+                    prefinalQualityFeedback.Quality_Grade = 'B';
+                }
+
+                if (validityGrade === 'A' && percentageIntNumConfValidity < 75) {
+                    prefinalValidityFeedback.Validity_Grade = 'B';
+                }
+                if (qualityGrade === 'A' && percentageIntNumConfValidity < 80) {
+                    prefinalQualityFeedback.Quality_Grade = 'B';
+                }
+
+                // If the validity grade is A, then the validity feedback is ready to go
+                let finalValidityFeedback;
+                if (validityGrade === 'A') {
+                    finalValidityFeedback = prefinalValidityFeedback;
+                }
+
+                // For solutions graded as B/E/F for the validity feedback: clean feedback from hints
+                if (BEFHintsFreeVersion) {
+                    if (!['A'].includes(validityGrade)) {
+                        finalValidityFeedback = {};
+                        for (const [key, value] of Object.entries(prefinalValidityFeedback)) {
+                            if (!["Answer Status", "Answer_Status", "Validity Grade", "Validity_Grade"].includes(key)) {
+                                finalValidityFeedback[key] = await this.genCleanedVersion(value);
+                            }
+                        }
+                        finalValidityFeedback.Validity_Grade = prefinalValidityFeedback.Validity_Grade;
+                    }
+                } else {
+                    finalValidityFeedback = prefinalValidityFeedback;
+                }
+
+                // Cleaning quality feedback
+                const finalQualityFeedback = {};
+                for (const [key, value] of Object.entries(prefinalQualityFeedback)) {
+                    if (!["Answer Status", "Answer_Status", "Quality Grade", "Quality_Grade"].includes(key)) {
+                        finalQualityFeedback[key] = await this.genCleanedVersion(value);
+                    }
+                }
+                finalQualityFeedback.Quality_Grade = prefinalQualityFeedback.Quality_Grade;
+
+                // Combining the validity and quality feedback
+                const finalFeedback = {
+                    ...finalValidityFeedback,
+                    ...finalQualityFeedback,
+                    Overall_Grade: finalValidityFeedback.Validity_Grade + finalQualityFeedback.Quality_Grade
+                };
+
+                // Return the processed feedback
+                return finalFeedback;
+
+            } catch (e) {
+                prefinalValidityFeedback.Validity_Grade = '-';
+                prefinalQualityFeedback.Quality_Grade = '-';
+                const finalFeedback = {
+                    ...prefinalValidityFeedback,
+                    ...prefinalQualityFeedback,
+                    Overall_Grade: '-'
+                };
+                return finalFeedback;
+            }
+        }
+
+        // If we reached this point, something unexpected happened
         return {
-            'Overall Grade': '-',
-            'Status': 'Unexpected Error... It could be your connection, it could be something on our end. Sorry :('
+            Overall_Grade: '-',
+            Status: 'Unexpected Error... It could be your connection, it could be something on our end, sorry. You can try resubmitting though! If the issue persists, contact hello@quanta.world.'
         };
     }
 }
 
-const sanityInstruction = `
-# Overview
-Your task is to conduct a high-level sanity check of the given solution. This means assessing whether the input is not overly brief and whether it has the potential to contain meaningful or useful ideas. 
-- You **MUST NOT** check for clarity of explanations, 
-- You **MUST NOT** take into account the quality of presentation
-- YOU **MUST NOT** delve into specific details such as algebraic correctness
-- You **MUST NOT** verify the answer or comment on its correctness
-Focus only on the general structure to see if the input might offer valuable insights or valid claims at a surface level.
 
-# Input
-You will receive:
-- Problem Statement
-- One or more correct solutions to the problem
-- Input Solution to verify
-
-# Output
-Carefully review the entire prompt. Then follow the steps below when generating feedback in JSON format:
-
-1. If the Input Solution meets any of the following criteria:
-    - It is extremely brief, considering the complexity of the problem's correct solutions (e.g only 1-2 sentences or less than one-tenth the length of the correct solutions).
-    - It is total nonsense or only loosely related to the problem.
-    - It lacks any formalism and is brief.
-    
-Then, output a dictionary in the following format:
-{
-   "Sanity Status": "Fail",
-   "Sanity Status Justification": "... (insert a very brief and friendly-yet-strict-sounding summary of the reason for the Fail here)"
-}
-
-Where appropriate (which will be in most cases), conclude your justification with a positive phrase like: "Please put more effort into explaining and presenting your solution next time :)"
-
-2. If none of the above applies, then output the following in JSON format:
-{
-    "Sanity Status": "Pass",
-    "Sanity Status Justification": "-"
-}
-In this case, no justification is required.
-
-# Examples of Outputs
-## Example 1
-{
-    "Sanity_status": "Fail",
-    "Sanity Status Justification": "What you submitted is a recipe for how to answer such kind of questions, rather than an actual solution... Please put more effort into your submission next time :)",
-}
-
-## Example 2
-{
-    "Sanity Status": "Pass",
-    "Sanity Status Justification": "-",
-}`;
-const solutionRefiner = `
-# Overview
-Your task is to proofread and refine the provided solution, ensuring it is more readable and polished.
-
-# Main Rules
-- You **must NOT** introduce any new ideas or logical steps.
-- You **must NOT** change the flow of the original solution.
-- You **must NOT** change any numbers, algebraic manipulations or notations involved. Do not introduce new variables or objects as well!
-- You **must NOT** fill in gaps in the explanations, algebraic manipulations. Similarly, you must **NOT** elaborate on any of the claims.
-- You **must NOT** fix any errors whatsoever. If the original solution is wrong, has mistakes, has a wrong answer, etc... you must keep all that. Keep the solution as it is in terms of validity.
-- Please focus on fixing grammar issues, improving awkward or unclear phrasing, and making the solution more presentable by breaking it into clear steps. That is all.
-
-# Output
-- The length of the refined solution must **NOT** exceed twice the length of the original solution, however it **SHOULD BE** at least as long as the original solution.
-- In the output, please include only the refined version of the solution in **Markdown + LaTeX** format. So in particular:
-    - Do **NOT** include the problem statement or any key phrases like "## Here is the refined solution" or "## Solution". Simply output the refined solution.
-    - Do **NOT** include the '\`\`\`markdown' at the beginning or any similar markers. Only output the refined content.
-
-# Example 1
-If the Problem Statement is "Perla throws a fair coin 11 times, and Jason throws a fair coin 10 times. What is the probability Perla gets more heads than Jason?", and the Input Solution is:
-"Answer is 1/2, and this is because P(Perla gets more heads than Jason) = P(Perla gets more tails than Jason) and so each of these events has probability 1/2."
-then, even though the solution is not complete, the refined version that you need to output should be something like this:
-"
-**Answer:** $\\frac{1}{2}$.
-
-**Solution:**
-Note that $\\mathbb{P}(\\text{Perla gets more heads than Jason}) = \\mathbb{P}(\\text{Perla gets more tails than Jason})$, therefore each of these two events has probability $1/2$. Therefore, in particular, the probability that Perla gets more heads than Jason is $1/2$.
-"`;
-const validityInstruction =`
-# Overview
-Your task is to provide concise and useful feedback on the validity of the input solution, which was most likely generated by a high schooler or a university student.
-
-# Input
-You will receive:
-- Problem Statement
-- One or more correct solutions to the problem
-- Optional extra requirements for validation process
-- Input Solution to evaluate
-- Proofread and potentially clearer version of the Input Solution
-
-# Output
-Carefully review the entire prompt. Then proceed to generating the feedback a JSON dictionary, addressing the following items:
-    1. Answer Status: Cosmpare the Input Solution's answer to the correct solution (if applicable for this problem at all) and conclude if the answer is 'Correct', 'Wrong or Unclear', or 'Non-applicable for this problem'. Note that the answer is not always explicitly stated in the Input Solution, but it might be correctly mentioned somewhere.
-    2. Major Conceptual Errors: List conceptually important errors that prevent the Input Solution and its Proofread version from being even halfway complete, and explain in simple words (and by providing some simple examples) for why it is applicable. Include major issues like 
-        - solving a different problem, or not actually solving a major part of it 
-        - incomplete (or non-existant) proof for why the answer contains all of the possibilities and nothing else, 
-        - missing the proof of necessity/sufficiency or anything of similar calibre.
-        - anything else of similar calibre that is also a 'high-level' conceptual kind of an error
-    If no such errors exist, output 'None'.
-    3. Nontrivial Mistakes or Unjustified Claims: List 
-        - non-trivial algebraic or logical mistakes that affect the solution's validity, 
-        - nontrivial mathematical claims or statements in the Input Solution or its proofread version that lack proper justification and (if there are any) extra requirements on validity that have not been met by the Input Solution and its proofread version. 
-    Where applicable, please cite the relevant part of the solution and provide a brief explanation. If there are no such errors, output 'None'.
-    4. Explanation Good Aspects Summary: Briefly summarize the key positive nontrivial (given the difficulty of the problem) aspects and significant progress made in the Input Solution: if there are a few of them, list them in an numbered list as '1. ... \\n2. ... \\n3....'. Please ignore how the solution is presented (e.g. do not comment if the solution is nicely formatted or not), if it is clear or not and fully avoid discussing the answer status unless the solution seems completely correct.
-    5. Validity Grade: Carefully process your feedback you just created together with the Input Solution one more time, and output the grade based on the following rubric:
-        - A: The Input Solution is fully correct — no conceptual errors, unjustified non-trivial claims, or algebraic/logical mistakes.
-        - B: The Input Solution is nearly correct — no conceptual errors, but may contain one easy-to-fix unjustified claim or a few minor algebraic/logical mistakes. Even if the answer is wrong only because of one simple calculation error, the grade should be B.
-        - E: The Input Solution has conceptual errors, unjustified claims, and/or several algebraic/logical mistakes, but includes at least one solid useful (for some correct solution) idea or resembles a sketch of a correct solution (from the conceptual standpoint).
-        - F: The Input Solution shows no significant progress or useful ideas (even if the answer is correct), and/or contains numerous conceptual errors, logical mistakes, or unjustified claims, and thus has no meaningful progress.
-      
-# Examples
-
-## Example Output 1
-{
-    "Answer Status": "Wrong or Unclear",
-    "Major Conceptual Errors": "1. 'Using this, part (a) is obvious.' is not a valid explanation. Thus, you still have part (a) of the problem to explicitly solve.
-2. You haven't addressed the last part of the problem, which asks for an explanation of why the probability in part (b) is higher than in part (a). Without this explanation, your solution will not be considered complete.",
-    "Nontrivial Mistakes or Unjustified Claims": "By stirling's approximation, \\(\\binom{2n}{n} \\sim \\frac{2^{2n}}{\\sqrt{\\pi n}}\\)' — You need to provide more details, particularly the algebraic manipulations, on how you used Stirling's Approximation to arrive at this expression. Note that Stirling's Approximation applies to $n!$, not directly to $\\binom{2n}{n}$.",
-    "Explanation Good Aspects Summary": "1. You correctly identified the fact that you need to use Stirling's Approximation to approximate the $\\binom{2n}{n}$.
-2. The algebraic manipulations for answering the first question from the part (b) are essentially there.",
-    "Validity Grade": "E"
-}
-
-## Example Output 2
-{
-    "Answer Status": "Correct",
-    "Major Conceptual Errors": "None",
-    "Nontrivial Mistakes or Unjustified Claims": "M has the following probability distribution: ...' needs to be further explained, i.e. please provide a few more details for how you obtained those numbers $\\frac{11}{36}, \\frac{9}{36}, \\frac{7}{36},  \\frac{5}{36},  \\frac{3}{36},  \\frac{1}{36}$.",
-    "Explanation Good Aspects Summary": "Your reasoning is essentially correct. Almost all the necessary steps to calculate and justify the expected value of $M$ are present. Well done!",
-    "Validity Grade": "B"
-}
-
-## Example Output 3
-{
-    "Answer Status": "Correct",
-    "Major Conceptual Errors": "None",
-    "Nontrivial Mistakes or Unjustified Claims": "None",
-    "Explanation Good Aspects Summary": "1. Your answer and, more importantly, your explanation are both correct: The probability of getting an even number of tails is indeed $1/2$. 
-2. Appreciate how you clearly defined the probability model at the beginning 👍 
-Overall, excellent work! ",
-    "Validity Grade": "A"
-}
-
-# General Rules to Follow at All Times
-- Make sure to consider the proofread version of the Input Solution when generating feedback. It might the case that the proofread version is more clear and thus obviously valid, while the original version is also valid but not very clear.
-- You must only cite parts of the Input Solution (where applicable), you **MUST NOT** refer or cite the proofread version of it in your feedback. 
-- Be strict and thorough, but maintain a friendly and charismatic tone.
-- Ensure feedback is concise and non-repetitive. Make sure to not duplicate any error in two different parts of your feedback.
-- Avoid being salesy or overly enthusiastic and instead express calm confidence.
-- Make your feedback direct by using phrases like 'your solution...', 'your claim...', 'you stated...'. This ensures the feedback feels personalized and specific to their work.
-- Feel free to pose questions in the 'Nontrivial_Mistakes_or_Unjustified_Claims', e.g. 'Could you please elaborate on ...' or 'Why is this ....?'
-- Use simple, clear direct language suitable for a high schooler or a student, avoid complex terminology (Aim for a Flesch reading score of 80 or higher)
-- Make sure to surround any citations with the '...' in your feedback.`;
-const feedbackCleaner = `
-Your sole purpose is to either keep the feedback as it is, or remove any references to the correct solution (if present). So:
-
-- Eliminate any mention of the correct (long) solution or answer. Focus on keeping the feedback neutral, without revealing or hinting at the correct response.
-- If need be, make only slight, necessary adjustments achieve to refine the feedback.
-- Do not add any new suggestions or information about how the solution should be structured or what the answer should be.
-- Focus on Unnecessary Content: Identify and remove any parts of the feedback that may distract or confuse the student, especially if they contain excessive explanation or unnecessary elaboration on the solution process.
-- Output json with the same set of keys as the original feedback
-
-Example 1:
-Original Feedback: 
-{
-    "Nontrivial Mistakes or Unjustified Claims": "We know that \\(\\binom{2n}{n} \\sim \\frac{2^{2n}}{\\sqrt{\\pi n}}\\)' — You need to provide more details, particularly the algebraic manipulations, on how you used Stirling's Approximation to arrive at this expression. In the correct solution, there are more steps used to justify this step.",
-    "Validity Grade": "E"
-}
-
-Revised Feedback:
-{
-    "Nontrivial Mistakes or Unjustified Claims": "We know that \\(\\binom{2n}{n} \\sim \\frac{2^{2n}}{\\sqrt{\\pi n}}\\)' — You need to provide more details on how you arrive at this expression.",
-    "Validity Grade": "E"
-}
-
-Example 2:
-Original Feedback:
-{
-    "Nontrivial Mistakes or Unjustified Claims": "M has the following probability distribution: ...' needs to be further explained, i.e. please provide a few more details for how you obtained those numbers $\\frac{11}{36}, \\frac{9}{36}, \\frac{7}{36},  \\frac{5}{36},  \\frac{3}{36},  \\frac{1}{36}$.",
-    "Validity Grade": "B"
-}
-
-Revised Feedback (should be the same as the original feedback in this case):
-{
-    "Nontrivial Mistakes or Unjustified Claims": "We know that \\(\\binom{2n}{n} \\sim \\frac{2^{2n}}{\\sqrt{\\pi n}}\\)' — You need to provide more details on how you arrive at this expression.",
-    "Validity Grade": "E"
-}`;
-
-const quantaFTT = new QuantaFTT(
-    process.env.OPENAI_API_KEY,
-    sanityInstruction,
-    solutionRefiner,
-    validityInstruction,
-    feedbackCleaner,
-    'gpt-4o',
-    'gpt-4o',
-    'gpt-4o',
-    'gpt-4o'
-);
-
+let quantaFTT = 0
 async function evaluateSolution(problem_statement, solution, student_solution, extra_requirements_validity) {
     try {
-        const response = await quantaFTT.gen_full_feedback(
+        const response = await quantaFTT.genFullFeedback(
             problem_statement,
             solution,
             student_solution,
@@ -755,9 +773,27 @@ app.get('/status', async (req, res) => {
     res.json({status: "ok"})
 })
 
+async function start_server(){
+     quantaFTT = new QuantaFTT(
+        process.env.OPENAI_API_KEY,
+        await readGoogleDocTextFile("https://drive.google.com/file/d/1XReBulydD8o1GCgkd8-aa0bbOmbTAM6N/view?usp=drive_link"),
+        await readGoogleDocTextFile("https://drive.google.com/file/d/1uZw64u3rzxN094Ili6gigSlAZJ1B8-ph/view?usp=drive_link"),
+        await readGoogleDocTextFile("https://drive.google.com/file/d/1h-bwOatPbaSlGRvVnsoIV1vIbGRIAXQk/view?usp=drive_link"),
+        await readGoogleDocTextFile("https://drive.google.com/file/d/1zeYVX7oM3z4ZmDUKaV2h9ax6MHDpTVE1/view?usp=drive_link"),
+        await readGoogleDocTextFile("https://drive.google.com/file/d/1okUgG70dE8H5IiD5sJucSTfSvT4dz_mc/view?usp=drive_link"),
+        await readGoogleDocTextFile("https://drive.google.com/file/d/13tZO582jxByr0ArbJMoZjlY8QsEnSjtP/view?usp=drive_link"),
+        await readGoogleDocTextFile("https://drive.google.com/file/d/1EphBjeagl0ra8S0x-H2JtG9iSUSyP1tA/view?usp=drive_link"),
+        await readGoogleDocTextFile("https://drive.google.com/file/d/1kuHh5aSDwqmvWOIXuZ6w696Rm3w43918/view?usp=drive_link"),
+        'gpt-4o-2024-08-06',
+        'gpt-4o-2024-08-06',
+        'gpt-4o-2024-08-06',
+        'gpt-4o-2024-08-06'
+    );
 
-const port = 3000;
+    const port = 3000;
+    http.createServer(app).listen(port, () => {
+        console.log('HTTP server running on port' + port);
+    });
+}
 
-http.createServer(app).listen(port, () => {
-    console.log('HTTP server running on port' + port);
-});
+start_server();
